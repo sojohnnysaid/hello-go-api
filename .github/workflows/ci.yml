@@ -1,0 +1,202 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # Needed for OIDC/Cosign
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'  # Don't fail the build on vulnerabilities (for now)
+      
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()  # Upload even if the scan finds vulnerabilities
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-image-scan'
+      
+      - name: Run Trivy in table format for PR comment
+        uses: aquasecurity/trivy-action@master
+        if: github.event_name == 'pull_request'
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      
+      - name: Sign container image with Cosign (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          echo "Signing image with Cosign..."
+          for tag in $(echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'); do
+            echo "Signing $tag"
+            cosign sign --yes $tag
+          done
+          echo "Image signing complete"
+      
+      - name: Verify image signature
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          echo "Verifying image signature..."
+          cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/heads/${{ github.ref_name }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" | jq .
+          echo "Image signature verified successfully"
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      
+      - name: Attach SBOM to image
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          echo "Attaching SBOM to container image..."
+          cosign attach sbom --sbom sbom.spdx.json \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          echo "SBOM attached successfully"
+      
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+          retention-days: 30
+  update-gitops:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: sojohnnysaid/k8s
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+      
+      - name: Update image tag in GitOps repo
+        run: |
+          cd gitops
+          # Create app deployment directory if it doesn't exist
+          mkdir -p argocd-apps/hello-go-api
+          
+          # Create kustomization.yaml if it doesn't exist
+          if [ ! -f argocd-apps/hello-go-api/kustomization.yaml ]; then
+            cat > argocd-apps/hello-go-api/kustomization.yaml << 'KUSTOMIZATION'
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - deployment.yaml
+            - service.yaml
+          images:
+            - name: ghcr.io/sojohnnysaid/hello-go-api
+              newTag: latest
+          KUSTOMIZATION
+          fi
+          
+          # Update the image tag using kustomize
+          cd argocd-apps/hello-go-api
+          
+          # Install kustomize if not available
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          
+          # Update image tag
+          ./kustomize edit set image ghcr.io/sojohnnysaid/hello-go-api:main-${{ github.sha }}
+          
+          # Clean up kustomize binary
+          rm ./kustomize
+      
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+          commit-message: "chore: update hello-go-api image to main-${{ github.sha }}"
+          title: "🚀 Deploy hello-go-api main-${{ github.sha }}"
+          body: |
+            ## Automated Image Update
+            
+            Updates the hello-go-api image tag to: `main-${{ github.sha }}`
+            
+            ### Build Information
+            - **Commit**: ${{ github.sha }}
+            - **Commit Message**: ${{ github.event.head_commit.message }}
+            - **Author**: ${{ github.actor }}
+            - **Workflow Run**: [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            ### Security Scan Results
+            - ✅ Image signed with Cosign
+            - ✅ SBOM generated and attached
+            - ✅ Vulnerability scan completed
+            
+            ---
+            *This PR was automatically created by the CI pipeline*
+          branch: deploy/hello-go-api-${{ github.sha }}
+          delete-branch: true
+          labels: |
+            automated
+            deployment
+          assignees: ${{ github.actor }}
