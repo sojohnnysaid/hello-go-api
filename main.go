@@ -42,11 +42,11 @@ func main() {
 	})
 
 	// Start the server!
-	fmt.Println("API server starting on http://127.0.0.1:8888")
+	fmt.Println("API server starting on http://0.0.0.0:8888")
 	fmt.Println("Documentation available at:")
-	fmt.Println("  - Interactive docs: http://127.0.0.1:8888/docs")
-	fmt.Println("  - OpenAPI JSON: http://127.0.0.1:8888/openapi.json")
-	fmt.Println("  - OpenAPI YAML: http://127.0.0.1:8888/openapi.yaml")
+	fmt.Println("  - Interactive docs: http://0.0.0.0:8888/docs")
+	fmt.Println("  - OpenAPI JSON: http://0.0.0.0:8888/openapi.json")
+	fmt.Println("  - OpenAPI YAML: http://0.0.0.0:8888/openapi.yaml")
 	
-	http.ListenAndServe("127.0.0.1:8888", router)
+	http.ListenAndServe("0.0.0.0:8888", router)
 }
