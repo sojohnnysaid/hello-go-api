@@ -55,7 +55,7 @@ jobs:
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ github.sha }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
@@ -73,7 +73,7 @@ jobs:
         uses: aquasecurity/trivy-action@master
         if: github.event_name == 'pull_request'
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ github.sha }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           format: 'table'
           exit-code: '0'
           severity: 'CRITICAL,HIGH,MEDIUM'
@@ -96,14 +96,14 @@ jobs:
           COSIGN_EXPERIMENTAL: 1
         run: |
           echo "Verifying image signature..."
-          cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ github.sha }} \
+          cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} \
             --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/heads/${{ github.ref_name }}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" | jq .
           echo "Image signature verified successfully"
       - name: Generate SBOM with Syft
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ github.sha }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           format: spdx-json
           output-file: sbom.spdx.json
       
@@ -113,7 +113,7 @@ jobs:
         run: |
           echo "Attaching SBOM to container image..."
           cosign attach sbom --sbom sbom.spdx.json \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           echo "SBOM attached successfully"
       
       - name: Upload SBOM as artifact
@@ -164,8 +164,9 @@ jobs:
           # Install kustomize if not available
           curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
           
-          # Update image tag
-          ./kustomize edit set image ghcr.io/sojohnnysaid/hello-go-api:main-${{ github.sha }}
+          # Update image tag (using shortened SHA to match what Docker metadata generates)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          ./kustomize edit set image ghcr.io/sojohnnysaid/hello-go-api:main-${SHORT_SHA}
           
           # Clean up kustomize binary
           rm ./kustomize
@@ -181,6 +182,7 @@ jobs:
             ## Automated Image Update
             
             Updates the hello-go-api image tag to: `main-${{ github.sha }}`
+            (Short tag: `main-${{ steps.meta.outputs.version }}`)
             
             ### Build Information
             - **Commit**: ${{ github.sha }}
